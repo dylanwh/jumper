@@ -1,0 +1,330 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite -signatures;
+
+use JSON::Validator;
+use Mojo::Collection qw(c);
+use Mojo::File qw(path);
+use Mojo::JSON qw(decode_json);
+use Mojo::SQLite;
+use Mojo::Util qw(trim);
+use PerlX::Maybe;
+use Socket qw(inet_ntoa);
+
+my $sql = Mojo::SQLite->new;
+$sql->from_filename(app->home->child('jumper.db'));
+$sql->auto_migrate(1);
+$sql->migrations->from_data;
+
+post '/rebuild' => sub ($c) {
+  $sql->db->query("INSERT INTO search_items(search_items) VALUES('rebuild');");
+  $c->render(json => { status => 'ok' });
+};
+
+get '/items' => sub ($c) {
+  $c->render(json => $sql->db->query("SELECT * from items")->hashes);
+};
+
+get '/items/:file' => sub ($c) {
+  $c->render(json => $sql->db->query("SELECT title, subtitle, url, tags from items WHERE file = ? ", $c->stash->{file})->hashes);
+};
+
+post '/items/:file/*title' => sub ($c) {
+  my $req  = $c->req;
+  my $item = {
+    file           => $c->stash->{file},
+    title          => $c->stash->{title},
+    maybe subtitle => $req->param('subtitle'),
+    maybe tags     => $req->param('tags'),
+    url            => $req->param('url'),
+  };
+  $c->add_items([$item]);
+  $c->render(json => { status => 'ok' });
+};
+
+get '/items/:file/*title' => sub ($c) {
+  $c->render(
+    json => $sql->db->query(
+      "SELECT subtitle, url, tags from items WHERE file = ? AND title = ?", $c->stash->{file},
+      $c->stash->{title}
+    )->hashes
+  );
+};
+
+del '/items/:file/*title' => sub ($c) {
+  my $db = $sql->db;
+  my $tx = $db->begin;
+  $db->query("DELETE from items WHERE file = ? AND title = ?",
+    $c->stash->{file}, $c->stash->{title});
+  $tx->commit;
+  $c->render(json => {status => 'ok'});
+};
+
+post '/items' => sub ($c) {
+  state $jv = JSON::Validator->new->schema({
+    type       => 'object',
+    required   => ['items'],
+    properties => {
+      items => {
+        type  => 'array',
+        items => {
+          type       => 'object',
+          properties => {
+            file     => {type => 'string'},
+            title    => {type => 'string'},
+            subtitle => {type => ['string', 'null']},
+            url      => {type => 'string'},
+            tags     => {type => ['string', 'null']},
+          },
+          required => ['file', 'title', 'url'],
+        }
+      }
+    }
+  });
+  my $doc = $c->req->json;
+  my @errors = $jv->validate($doc);
+  if (@errors) {
+    $c->render(json => {errors => \@errors});
+    return 0
+  }
+  $c->add_items($doc->{items});
+  $c->render(json => {status => "ok"});
+};
+
+get '/' => sub ($c) {
+  $c->render('index');
+};
+
+get '/opensearch' => sub ($c) {
+  if ($c->stash->{format} eq 'xml') {
+    $c->res->headers->content_type('application/opensearchdescription+xml');
+  }
+  $c->render();
+};
+
+any '/search' => sub ($c) {
+    my $terms  = trim($c->req->params->param('q') // '');
+    my $format = $c->stash->{format} // '';
+
+    my $items = $c->search($terms) // $c->fallback_search($terms) // c();
+    $c->stash->{items} = $items;
+
+    if ( $format eq 'json' ) {
+        $c->render( json => { items => $items } );
+        return
+    }
+    if ($format eq 'alfred') {
+        $c->render( json => { items => $items->map(\&_to_alfred) } );
+        return
+    }
+
+    if ( $format eq 'suggest' ) {
+        $c->res->headers->content_type('application/x-suggestions+json');
+        $c->render( json => [ $terms, [ map { $_->{title} } @$items ]] );
+        return;
+    }
+
+    if ( $format ne 'txt' && @$items == 1 ) {
+      $c->res->code(307);
+      $c->redirect_to( $items->[0]{url} );
+    }
+    else {
+      $c->render();
+    }
+};
+
+helper 'search' => sub ($c, $terms) {
+  return undef unless $terms;
+
+  my $db     = $sql->db;
+  my $select =  'SELECT * FROM search_items WHERE search_items MATCH ? ORDER BY bm25(search_items) LIMIT 100';
+
+  if ($terms =~ /^(-)?(\w+):\s*(.*)$/) {
+    my $not = $1 // '';
+    $terms = $not . qq{file:$2 } . _quote_terms($3);
+  }
+  else {
+    $terms = _quote_terms($terms);
+  }
+  warn "search: $terms\n";
+  my $items = $db->query($select, $terms)->hashes;
+  return @$items ? $items : undef;
+};
+
+helper 'add_items' => sub ($c, $items) {
+  my $db     = $sql->db;
+  my $tx     = $db->begin;
+  foreach my $item (@$items) {
+    $db->query($c->add_item_query($item));
+  }
+  $tx->commit;
+};
+
+helper 'add_item_query' => sub ($c, $item) {
+  my $insert = q{
+    INSERT INTO items (file, title, subtitle, url, tags) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (file, title) DO UPDATE SET subtitle = ?, url = ?, tags = ?
+  };
+  return (
+    $insert,           $item->{file}, $item->{title},
+    $item->{subtitle}, $item->{url},  $item->{tags},
+    $item->{subtitle}, $item->{url},  $item->{tags}
+  );
+};
+
+helper 'fallback_search' => sub ($c, $terms) {
+  return undef unless $terms;
+
+  my @items;
+  if ($terms =~ /^\w+::\w+/a) {
+    my $url = Mojo::URL->new("https://metacpan.org/search?size=20");
+    $url->query(q => $terms);
+    push @items, {
+      title    => "CPAN",
+      subtitle => "Search for $terms",
+      url      => $url,
+    };
+  }
+  if ($terms =~ /[a-zA-Z0-9]\.[a-zA-Z0-9]/) {
+    my $ip = inet_ntoa(scalar gethostbyname($terms));
+    if ($ip ne '0.0.0.0') {
+      my $url = Mojo::URL->new("https://$terms");
+      push @items, {
+        title    => "$terms",
+        subtitle => "ip $ip",
+        url      => $url,
+      };
+    }
+  }
+  if ($terms =~ s/^g(?:oogle)\s+//) {
+    my $url = Mojo::URL->new("https://google.com/search");
+    $url->query(q => $terms);
+    push @items, {
+      title    => "Google",
+      subtitle => "Search for $terms",
+      url      => $url,
+    };
+  }
+  # else {
+  #   my $url = Mojo::URL->new("https://google.com/search");
+  #   $url->query(q => $terms);
+  #   return $url;
+  # }
+  return c(@items);
+};
+
+# Move first part and slash from path to base path in production mode
+hook before_dispatch => sub ($c) {
+  push @{$c->req->url->base->path->trailing_slash(1)},
+    shift @{$c->req->url->path->leading_slash(0)};
+};
+
+app->start;
+
+sub _to_alfred($item) {
+  return {
+    title => $item->{title},
+    maybe
+      subtitle => $item->{subtitle},
+    arg => $item->{url},
+    uid => "$item->{file}:$item->{title}",
+  };
+}
+
+sub _quote_term($term) {
+  return substr($term, 0, 1), _quote_term(substr($term, 1))  if $term =~ /^[-^]/;
+  if (length $term < 3) {
+    return join(' OR ', map { $term . $_ } 'a' .. 'z');
+  }
+  return $term if $term =~ /^\w+$/;
+  $term =~ s/"/\\"/gs;
+  return qq{"$term"};
+}
+sub _quote_terms($terms) {
+  my @terms = split(/\s+/, $terms);
+
+  return join(' ', map { _quote_term($_) } @terms);
+}
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Welcome';
+<h1>Palladins Kill Jumpers.</h1>
+
+No palladins allowed.
+
+@@ search.html.ep
+% layout 'default';
+% title 'Links';
+
+<ul>
+% foreach my $item (@$items) {
+<li>
+%= link_to $item->{title} => $item->{url};
+</li>
+%}
+
+@@ search.txt.ep
+% foreach my $item (@$items) {
+%== "$item->{title}\t$item->{url}\t$item->{tags}"
+%}
+
+@@ opensearch.xml.ep
+
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Jumper</ShortName>
+  <Description>Paladins Kill Jumpers</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  %#<Image width="16" height="16" type="image/x-icon">[https://example.com/favicon.ico]</Image>
+  <Url type="text/html" template="<%= $c->url_for('/search')->to_abs %>">
+    <Param name="q" value="{searchTerms}"/>
+  </Url>
+  <Url type="application/x-suggestions+json" template="<%= $c->url_for('/search.suggest')->to_abs %>">
+    <Param name="q" value="{searchTerms}"/>
+  </Url>
+</OpenSearchDescription>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+ <link rel="search"
+      type="application/opensearchdescription+xml"
+      title="Put on your Jumper"
+      href="<%= $c->url_for('/opensearch.xml')->to_abs %>">
+  <title><%= title %></title></head>
+  <body><%= content %></body>
+</html>
+@@ migrations
+-- 1 up
+CREATE TABLE items (
+  file TEXT NOT NULL,
+  title TEXT NOT NULL,
+  subtitle TEXT DEFAULT NULL,
+  tags TEXT,
+  url TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE search_items
+USING FTS5(file, title, subtitle, tags, url UNINDEXED, content=items, tokenize="trigram");
+CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
+INSERT INTO search_items(rowid, file, title, subtitle, tags)
+  VALUES (new.rowid, new.file, new.title, new.subtitle, new.tags);
+END;
+CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
+INSERT INTO search_items(search_items, rowid, file, title, subtitle, tags) 
+  VALUES('delete', old.rowid, old.file, old.title, old.subtitle, old.tags);
+END;
+CREATE TRIGGER items_au AFTER UPDATE ON items BEGIN
+INSERT INTO search_items(search_items, rowid, file, title, subtitle, tags) 
+  VALUES('delete', old.rowid, old.file, old.title, old.subtitle, old.tags);
+INSERT INTO search_items(rowid, file, title, subtitle, tags)
+  VALUES (new.rowid, new.file, new.title, new.subtitle, new.tags);
+END;
+-- 1 down
+DROP TABLE search_items;
+DROP TABLE items;
+-- 2 up
+CREATE UNIQUE INDEX item_uid ON items (file, title);
+-- 2 down
+DROP INDEX item_uid ON items;
